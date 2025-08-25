@@ -1,283 +1,292 @@
-#BANK MANAGEMENT USING TKINTER FOR GUI
+# BANK MANAGEMENT SYSTEM
+
 import tkinter as tk
-from tkinter import messagebox
-from tkinter import ttk
+from tkinter import messagebox, ttk
 import sqlite3
 import random
-import os
+import hashlib
+import logging
+from datetime import datetime
 
-DB_FILE = "bank.db"
+# Data & Visualization Libraries
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.dates import DateFormatter
 
-# Map each UI element to your actual icon file path.
-# If a value is "", it will try icons/<key>.png automatically.
-ICON_FILES = {
-    "bank": "icons/bank.png",
-    "create": "icons/create.png",
-    "login": "icons/login.png",
-    "exit": "icons/exit.png",
-    "deposit": "icons/deposit.png",
-    "withdraw": "icons/withdraw.png",
-    "statement": "icons/statement.png",
-    "logout": "icons/logout.png",
-    "back": "icons/back.png",
-    "otp": "icons/otp.png",
-    "user": "icons/user.png",
-    "phone": "icons/phone.png",
-    "password": "icons/password.png",
-}
-
-# ---------- Database setup ----------
-conn = sqlite3.connect(DB_FILE)
-conn.row_factory = sqlite3.Row
-cursor = conn.cursor()
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS accounts (
-    username TEXT PRIMARY KEY,
-    password TEXT NOT NULL,
-    phone TEXT NOT NULL,
-    balance REAL NOT NULL DEFAULT 0
+# --- Setup Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    filename='bank_app.log',
+    filemode='a'
 )
-""")
-conn.commit()
+
+# --- Constants ---
+DB_FILE = "bank_enhanced.db"
+
+# --- Database Manager ---
+class DatabaseManager:
+    """Handles all interactions with the SQLite database."""
+    def __init__(self, db_file: str):
+        try:
+            self.conn = sqlite3.connect(db_file)
+            self.conn.row_factory = sqlite3.Row
+            self.cursor = self.conn.cursor()
+            self.create_tables()
+            logging.info("Database connection successful and tables ensured.")
+        except sqlite3.Error as e:
+            logging.error(f"Database connection failed: {e}")
+            raise
+
+    def _hash_password(self, password: str) -> str:
+        return hashlib.sha256(password.encode()).hexdigest()
+
+    def create_tables(self):
+        self.cursor.execute("""
+        CREATE TABLE IF NOT EXISTS accounts (
+            username TEXT PRIMARY KEY,
+            password_hash TEXT NOT NULL,
+            phone TEXT NOT NULL UNIQUE,
+            balance REAL NOT NULL DEFAULT 0
+        )
+        """)
+        self.cursor.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            transaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            timestamp DATETIME NOT NULL,
+            transaction_type TEXT NOT NULL,
+            amount REAL NOT NULL,
+            balance_after REAL NOT NULL,
+            FOREIGN KEY (username) REFERENCES accounts(username) ON DELETE CASCADE
+        )
+        """)
+        self.conn.commit()
+
+    def create_account(self, username: str, password: str, phone: str) -> bool:
+        try:
+            hashed_password = self._hash_password(password)
+            self.cursor.execute(
+                "INSERT INTO accounts (username, password_hash, phone, balance) VALUES (?, ?, ?, ?)",
+                (username, hashed_password, phone, 0.0)
+            )
+            self._record_transaction(username, 'Account Creation', 0.0, 0.0)
+            self.conn.commit()
+            logging.info(f"Account created successfully for user: {username}")
+            return True
+        except sqlite3.IntegrityError as e:
+            logging.warning(f"Failed to create account for {username}: {e}")
+            return False
+
+    def verify_login(self, username: str, password: str) -> (dict | None):
+        hashed_password = self._hash_password(password)
+        self.cursor.execute(
+            "SELECT * FROM accounts WHERE username = ? AND password_hash = ?",
+            (username, hashed_password)
+        )
+        account = self.cursor.fetchone()
+        if account:
+            logging.info(f"User '{username}' logged in successfully.")
+            return dict(account)
+        logging.warning(f"Failed login attempt for user: '{username}'")
+        return None
+
+    def _record_transaction(self, username: str, trans_type: str, amount: float, new_balance: float):
+        self.cursor.execute(
+            """INSERT INTO transactions
+               (username, timestamp, transaction_type, amount, balance_after)
+               VALUES (?, ?, ?, ?, ?)""",
+            (username, datetime.now(), trans_type, amount, new_balance)
+        )
+
+    def deposit(self, username: str, amount: float) -> float:
+        self.cursor.execute("SELECT balance FROM accounts WHERE username = ?", (username,))
+        current_balance = self.cursor.fetchone()['balance']
+        new_balance = current_balance + amount
+        self.cursor.execute("UPDATE accounts SET balance = ? WHERE username = ?", (new_balance, username))
+        self._record_transaction(username, 'Deposit', amount, new_balance)
+        self.conn.commit()
+        logging.info(f"User '{username}' deposited {amount}. New balance: {new_balance}")
+        return new_balance
+
+    def withdraw(self, username: str, amount: float) -> (float | None):
+        self.cursor.execute("SELECT balance FROM accounts WHERE username = ?", (username,))
+        current_balance = self.cursor.fetchone()['balance']
+        if amount > current_balance:
+            logging.warning(f"User '{username}' failed withdrawal due to insufficient funds.")
+            return None
+        new_balance = current_balance - amount
+        self.cursor.execute("UPDATE accounts SET balance = ? WHERE username = ?", (new_balance, username))
+        self._record_transaction(username, 'Withdrawal', -amount, new_balance)
+        self.conn.commit()
+        logging.info(f"User '{username}' withdrew {amount}. New balance: {new_balance}")
+        return new_balance
+
+    def get_transactions(self, username: str) -> list:
+        self.cursor.execute(
+            "SELECT timestamp, transaction_type, amount, balance_after FROM transactions WHERE username = ? ORDER BY timestamp ASC",
+            (username,)
+        )
+        return [dict(row) for row in self.cursor.fetchall()]
+
+    def close(self):
+        if self.conn:
+            self.conn.commit()
+            self.conn.close()
+            logging.info("Database connection closed.")
 
 
-# ---------- Icons ----------
-class IconManager:
-    def __init__(self, root, mapping, default_dir="icons", default_ext=".png"):
-        self._root = root
-        self._imgs = {}
-        self.default_dir = default_dir
-        self.default_ext = default_ext
-        self._load_all(mapping)
-
-    def _resolve_path(self, key, path):
-        if path and os.path.exists(path):
-            return path
-        fallback = os.path.join(self.default_dir, f"{key}{self.default_ext}")
-        return fallback if os.path.exists(fallback) else None
-
-    def _load_all(self, mapping):
-        for key, path in mapping.items():
-            resolved = self._resolve_path(key, path)
-            if resolved:
-                try:
-                    self._imgs[key] = tk.PhotoImage(file=resolved)
-                except Exception:
-                    self._imgs[key] = None
-            else:
-                self._imgs[key] = None
-
-    def get(self, key):
-        return self._imgs.get(key)
-
-    def set_window_icon(self, window, key):
-        img = self.get(key)
-        if img:
-            try:
-                window.iconphoto(True, img)
-            except Exception:
-                pass
-
-
+# --- Main Application ---
 class BankApp:
-    def __init__(self, root):
+    def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Sandeep Bank")
-        self.root.geometry("360x560")
+        self.root.title("Sandeep Bank - Enhanced")
+        self.root.geometry("500x550")
         self.root.configure(bg="#f7f8fb")
         self.root.resizable(False, False)
 
-        # State
+        self.db = DatabaseManager(DB_FILE)
         self.current_account = None
         self.pending_user_data = {}
         self.generated_otp = None
 
-        # Icons
-        self.icons = IconManager(self.root, ICON_FILES)
-        self.icons.set_window_icon(self.root, "bank")
-
-        # Theme
-        style = ttk.Style()
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
-        style.configure("TButton", font=("Segoe UI", 10), padding=6)
-        style.configure("TLabel", font=("Segoe UI", 10), background="#f7f8fb")
-        style.configure("Header.TLabel", font=("Segoe UI", 14, "bold"))
-        style.configure("Title.TLabel", font=("Segoe UI", 12, "bold"))
-        style.map("TButton", background=[("active", "#e6e6e6")])
-
+        self._configure_styles()
         self.main_menu()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    # ---------- Layout helpers ----------
+    def _configure_styles(self):
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("TButton", font=("Segoe UI", 10), padding=6)
+        style.configure("TLabel", font=("Segoe UI", 10), background="#f7f8fb")
+        style.configure("Header.TLabel", font=("Segoe UI", 14, "bold"), background="#f7f8fb")
+        style.configure("Treeview", rowheight=25, font=("Segoe UI", 9))
+        style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
+        style.map("TButton", background=[("active", "#e6e6e6")])
+
     def clear_window(self):
-        for w in self.root.winfo_children():
-            w.destroy()
+        for widget in self.root.winfo_children():
+            widget.destroy()
 
-    def header(self, text="Sandeep Bank"):
+    def header(self, text: str = "Sandeep Bank"):
         frame = tk.Frame(self.root, bg="#f7f8fb")
-        frame.pack(pady=10)
-        logo = self.icons.get("bank")
-        if logo:
-            tk.Label(frame, image=logo, bg="#f7f8fb").pack(side="left", padx=6)
+        frame.pack(pady=20, fill="x", padx=25)
         ttk.Label(frame, text=text, style="Header.TLabel").pack(side="left")
-        return frame
 
-    def labeled_entry(self, parent, label, show=None, placeholder="", icon_name=None):
+    def create_labeled_entry(self, parent, label: str, show: str = None) -> ttk.Entry:
         row = tk.Frame(parent, bg="#f7f8fb")
         row.pack(fill="x", pady=6)
-        if icon_name and self.icons.get(icon_name):
-            tk.Label(row, image=self.icons.get(icon_name), bg="#f7f8fb").pack(side="left", padx=(0, 6))
-        ttk.Label(row, text=label).pack(anchor="w")
-        entry = ttk.Entry(row, show=show)
-        entry.pack(fill="x")
-        if placeholder:
-            self.add_placeholder(entry, placeholder, show=show)
+        ttk.Label(row, text=label, background="#f7f8fb").pack(anchor="w")
+        entry = ttk.Entry(row, show=show, font=("Segoe UI", 10))
+        entry.pack(fill="x", ipady=4)
         return entry
+    
+    def create_text_button(self, parent, text: str, cmd) -> ttk.Button:
+        button = ttk.Button(parent, text=text, command=cmd, style="TButton")
+        button.pack(fill="x", pady=5, ipady=4)
+        return button
 
-    def add_placeholder(self, entry, placeholder, show=None):
-        def on_focus_in(_):
-            if entry.get() == placeholder:
-                entry.delete(0, "end")
-                if show:
-                    entry.config(show=show)
-
-        def on_focus_out(_):
-            if not entry.get():
-                if show:
-                    entry.config(show="")
-                entry.insert(0, placeholder)
-
-        entry.insert(0, placeholder)
-        entry.bind("<FocusIn>", on_focus_in)
-        entry.bind("<FocusOut>", on_focus_out)
-
-    def image_button(self, parent, text, cmd, icon_name=None):
-        icon = self.icons.get(icon_name) if icon_name else None
-        if icon:
-            b = tk.Button(
-                parent, text=text, image=icon, compound="left",
-                command=cmd, font=("Segoe UI", 10), padx=8, pady=6,
-                bd=0, bg="#ffffff", activebackground="#f1f1f1", relief="flat"
-            )
-            b.pack(fill="x", pady=6)
-            return b
-        else:
-            btn = ttk.Button(parent, text=text, command=cmd)
-            btn.pack(fill="x", pady=6)
-            return btn
-
-    # ---------- Screens ----------
+    # --- Screens ---
     def main_menu(self):
         self.clear_window()
         self.header("Welcome to Sandeep Bank")
+        container = tk.Frame(self.root, bg="#f7f8fb", padx=50, pady=15)
+        container.pack(fill="both", expand=True)
 
-        container = tk.Frame(self.root, bg="#f7f8fb")
-        container.pack(fill="both", expand=True, padx=18, pady=10)
+        ttk.Label(container, text="Please select an option", font=("Segoe UI", 11)).pack(pady=(0, 15))
 
-        self.image_button(container, "Create account", self.create_account_screen, "create")
-        self.image_button(container, "Login", self.login_screen, "login")
-        self.image_button(container, "Exit", self.on_close, "exit")
-
-        tk.Label(self.root, text="Secure • Simple • Reliable", bg="#f7f8fb", fg="#666").pack(pady=8)
+        self.create_text_button(container, "Create New Account", self.create_account_screen)
+        self.create_text_button(container, "Login to Your Account", self.login_screen)
+        self.create_text_button(container, "Exit Application", self.on_close)
 
     def create_account_screen(self):
         self.clear_window()
-        self.header("Create account")
+        self.header("Create New Account")
+        container = tk.Frame(self.root, bg="#f7f8fb", padx=50, pady=10)
+        container.pack(fill="both", expand=True)
 
-        container = tk.Frame(self.root, bg="#f7f8fb")
-        container.pack(fill="both", expand=True, padx=18, pady=10)
+        username_entry = self.create_labeled_entry(container, "Username")
+        password_entry = self.create_labeled_entry(container, "Password", show="*")
+        phone_entry = self.create_labeled_entry(container, "Phone Number (10 digits)")
+        
+        button_frame = tk.Frame(container, bg="#f7f8fb", pady=15)
+        button_frame.pack(fill="x")
 
-        username_entry = self.labeled_entry(container, "Username", placeholder="Enter a unique username", icon_name="user")
-        password_entry = self.labeled_entry(container, "Password", show="*", placeholder="Enter a strong password", icon_name="password")
-        phone_entry = self.labeled_entry(container, "Phone number", placeholder="10-digit mobile number", icon_name="phone")
+        self.create_text_button(button_frame, "Send OTP", lambda: self.send_otp_action(username_entry, password_entry, phone_entry))
+        self.create_text_button(button_frame, "Back to Main Menu", self.main_menu)
 
-        def send_otp():
-            username = username_entry.get().strip()
-            password = password_entry.get().strip()
-            phone = phone_entry.get().strip()
+    def send_otp_action(self, username_entry, password_entry, phone_entry):
+        username = username_entry.get().strip()
+        password = password_entry.get().strip()
+        phone = phone_entry.get().strip()
 
-            if not username or username == "Enter a unique username":
-                messagebox.showerror("Error", "Username is required.")
-                return
-            if not password or password == "Enter a strong password":
-                messagebox.showerror("Error", "Password is required.")
-                return
-            if not phone.isdigit() or len(phone) != 10:
-                messagebox.showerror("Error", "Enter a valid 10-digit phone number.")
-                return
-
-            cursor.execute("SELECT 1 FROM accounts WHERE username = ?", (username,))
-            if cursor.fetchone():
-                messagebox.showerror("Error", "Username already exists. Choose another.")
-                return
-
-            self.generated_otp = f"{random.randint(100000, 999999)}"  # 6-digit OTP
-            self.pending_user_data = {"username": username, "password": password, "phone": phone}
-
-            messagebox.showinfo("OTP sent", f"An OTP has been sent to {phone} (simulated): {self.generated_otp}")
-            self.root.after(250, self.otp_verification_screen)
-
-        self.image_button(container, "Send OTP", send_otp, "otp")
-        self.image_button(container, "Back", self.main_menu, "back")
+        if not all([username, password, phone]):
+            messagebox.showerror("Error", "All fields are required.")
+            return
+        if not phone.isdigit() or len(phone) != 10:
+            messagebox.showerror("Error", "Enter a valid 10-digit phone number.")
+            return
+        
+        self.generated_otp = f"{random.randint(100000, 999999)}"
+        self.pending_user_data = {"username": username, "password": password, "phone": phone}
+        messagebox.showinfo("OTP Sent", f"Simulated OTP sent to {phone}: {self.generated_otp}")
+        self.otp_verification_screen()
 
     def otp_verification_screen(self):
         self.clear_window()
-        self.header("Verify OTP")
+        self.header("Verify Your OTP")
+        container = tk.Frame(self.root, bg="#f7f8fb", padx=50, pady=10)
+        container.pack(fill="both", expand=True)
+        otp_entry = self.create_labeled_entry(container, "Enter 6-Digit OTP")
+        
+        button_frame = tk.Frame(container, bg="#f7f8fb", pady=15)
+        button_frame.pack(fill="x")
 
-        container = tk.Frame(self.root, bg="#f7f8fb")
-        container.pack(fill="both", expand=True, padx=18, pady=10)
+        self.create_text_button(button_frame, "Verify & Create Account", lambda: self.verify_otp_action(otp_entry))
+        self.create_text_button(button_frame, "Back", self.create_account_screen)
 
-        otp_entry = self.labeled_entry(container, "Enter OTP", placeholder="6-digit code", icon_name="otp")
-
-        def verify():
-            entered = otp_entry.get().strip()
-            if entered == self.generated_otp:
-                data = self.pending_user_data
-                try:
-                    cursor.execute(
-                        "INSERT INTO accounts (username, password, phone, balance) VALUES (?, ?, ?, ?)",
-                        (data["username"], data["password"], data["phone"], 0.0)
-                    )
-                    conn.commit()
-                except sqlite3.IntegrityError:
-                    messagebox.showerror("Error", "Username already exists. Please try another.")
-                    return
-                messagebox.showinfo("Success", f"Account created for {data['username']}")
+    def verify_otp_action(self, otp_entry):
+        if otp_entry.get().strip() == self.generated_otp:
+            data = self.pending_user_data
+            if self.db.create_account(data["username"], data["password"], data["phone"]):
+                messagebox.showinfo("Success", f"Account created for {data['username']}!")
                 self.pending_user_data.clear()
                 self.generated_otp = None
-                self.root.after(200, self.main_menu)
+                self.main_menu()
             else:
-                messagebox.showerror("Error", "Incorrect OTP. Please try again.")
-
-        self.image_button(container, "Verify", verify, "otp")
-        self.image_button(container, "Back", self.create_account_screen, "back")
+                messagebox.showerror("Error", "Username or Phone number already exists.")
+        else:
+            messagebox.showerror("Error", "Incorrect OTP. Please try again.")
 
     def login_screen(self):
         self.clear_window()
-        self.header("Login")
+        self.header("Account Login")
+        container = tk.Frame(self.root, bg="#f7f8fb", padx=50, pady=10)
+        container.pack(fill="both", expand=True)
 
-        container = tk.Frame(self.root, bg="#f7f8fb")
-        container.pack(fill="both", expand=True, padx=18, pady=10)
+        username_entry = self.create_labeled_entry(container, "Username")
+        password_entry = self.create_labeled_entry(container, "Password", show="*")
+        
+        button_frame = tk.Frame(container, bg="#f7f8fb", pady=15)
+        button_frame.pack(fill="x")
 
-        username_entry = self.labeled_entry(container, "Username", placeholder="Your username", icon_name="user")
-        password_entry = self.labeled_entry(container, "Password", show="*", placeholder="Your password", icon_name="password")
+        self.create_text_button(button_frame, "Login", lambda: self.attempt_login_action(username_entry, password_entry))
+        self.create_text_button(button_frame, "Back to Main Menu", self.main_menu)
 
-        def login():
-            username = username_entry.get().strip()
-            password = password_entry.get().strip()
-            cursor.execute("SELECT * FROM accounts WHERE username = ? AND password = ?", (username, password))
-            row = cursor.fetchone()
-            if row:
-                self.current_account = dict(row)
-                self.root.after(200, self.account_menu)
-            else:
-                messagebox.showerror("Error", "Invalid username or password.")
-
-        self.image_button(container, "Login", login, "login")
-        self.image_button(container, "Back", self.main_menu, "back")
+    def attempt_login_action(self, username_entry, password_entry):
+        username = username_entry.get().strip()
+        password = password_entry.get().strip()
+        account_data = self.db.verify_login(username, password)
+        if account_data:
+            self.current_account = account_data
+            self.account_menu()
+        else:
+            messagebox.showerror("Login Failed", "Invalid username or password.")
 
     def account_menu(self):
         if not self.current_account:
@@ -285,103 +294,131 @@ class BankApp:
             return
 
         self.clear_window()
-        self.header(f"Hello, {self.current_account['username']}")
+        self.header(f"Welcome, {self.current_account['username']}")
+        
+        summary = tk.Frame(self.root, bg="#eef4ff", bd=1, relief="solid", highlightbackground="#d0dcff")
+        summary.pack(fill="x", padx=50, pady=(5, 15))
+        balance_str = f"Available Balance: ₹{self.current_account['balance']:.2f}"
+        tk.Label(summary, text=balance_str, bg="#eef4ff", fg="#334", font=("Segoe UI", 12, "bold")).pack(anchor="center", padx=10, pady=10)
+        
+        container = tk.Frame(self.root, bg="#f7f8fb", padx=50, pady=0)
+        container.pack(fill="both", expand=True)
 
-        summary = tk.Frame(self.root, bg="#eef4ff", bd=0, highlightbackground="#d0dcff", highlightthickness=1)
-        summary.pack(fill="x", padx=18, pady=(4, 10))
-        tk.Label(summary, text=f"Phone: {self.current_account['phone']}", bg="#eef4ff", fg="#334").pack(anchor="w", padx=10, pady=4)
-        tk.Label(summary, text=f"Balance: ₹{float(self.current_account['balance']):.2f}", bg="#eef4ff", fg="#334",
-                 font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=10, pady=(0, 8))
+        self.create_text_button(container, "Deposit Money", self.deposit_screen)
+        self.create_text_button(container, "Withdraw Money", self.withdraw_screen)
+        self.create_text_button(container, "View Statement & History", self.statement_screen)
+        self.create_text_button(container, "Logout", self.logout)
 
-        container = tk.Frame(self.root, bg="#f7f8fb")
-        container.pack(fill="both", expand=True, padx=18, pady=10)
-
-        self.image_button(container, "Deposit", self.deposit_screen, "deposit")
-        self.image_button(container, "Withdraw", self.withdraw_screen, "withdraw")
-        self.image_button(container, "Mini statement", self.show_statement, "statement")
-        self.image_button(container, "Logout", self.logout, "logout")
-
-    def deposit_screen(self):
+    def transaction_screen(self, mode: str):
         self.clear_window()
-        self.header("Deposit money")
+        self.header(f"{mode.title()} Money")
+        container = tk.Frame(self.root, bg="#f7f8fb", padx=50, pady=10)
+        container.pack(fill="both", expand=True)
+        amount_entry = self.create_labeled_entry(container, "Amount (₹)")
+        
+        button_frame = tk.Frame(container, bg="#f7f8fb", pady=15)
+        button_frame.pack(fill="x")
+        
+        self.create_text_button(button_frame, mode.title(), lambda: self.process_transaction_action(mode, amount_entry))
+        self.create_text_button(button_frame, "Back to Account Menu", self.account_menu)
 
-        container = tk.Frame(self.root, bg="#f7f8fb")
-        container.pack(fill="both", expand=True, padx=18, pady=10)
-
-        amount_entry = self.labeled_entry(container, "Amount (₹)", placeholder="Enter amount, e.g., 500.00")
-
-        def deposit():
-            try:
-                amount = float(amount_entry.get().strip())
-                if amount <= 0:
-                    raise ValueError
-                new_balance = float(self.current_account["balance"]) + amount
-                cursor.execute("UPDATE accounts SET balance = ? WHERE username = ?", (new_balance, self.current_account["username"]))
-                conn.commit()
-                self.current_account["balance"] = new_balance
-                messagebox.showinfo("Deposit", f"Deposited ₹{amount:.2f}. New balance: ₹{new_balance:.2f}")
-                self.root.after(200, self.account_menu)
-            except ValueError:
-                messagebox.showerror("Error", "Enter a valid positive amount.")
-
-        self.image_button(container, "Deposit", deposit, "deposit")
-        self.image_button(container, "Back", self.account_menu, "back")
-
-    def withdraw_screen(self):
-        self.clear_window()
-        self.header("Withdraw money")
-
-        container = tk.Frame(self.root, bg="#f7f8fb")
-        container.pack(fill="both", expand=True, padx=18, pady=10)
-
-        amount_entry = self.labeled_entry(container, "Amount (₹)", placeholder="Enter amount, e.g., 500.00")
-
-        def withdraw():
-            try:
-                amount = float(amount_entry.get().strip())
-                if amount <= 0:
-                    raise ValueError
-                if amount <= float(self.current_account["balance"]):
-                    new_balance = float(self.current_account["balance"]) - amount
-                    cursor.execute("UPDATE accounts SET balance = ? WHERE username = ?", (new_balance, self.current_account["username"]))
-                    conn.commit()
-                    self.current_account["balance"] = new_balance
-                    messagebox.showinfo("Withdraw", f"Withdrawn ₹{amount:.2f}. New balance: ₹{new_balance:.2f}")
+    def process_transaction_action(self, mode, amount_entry):
+        try:
+            amount = float(amount_entry.get().strip())
+            if amount <= 0: raise ValueError("Amount must be positive.")
+            
+            if mode == 'deposit':
+                new_balance = self.db.deposit(self.current_account['username'], amount)
+                self.current_account['balance'] = new_balance
+                messagebox.showinfo("Success", f"Deposited ₹{amount:.2f}.\nNew balance: ₹{new_balance:.2f}")
+            else: # withdraw
+                new_balance = self.db.withdraw(self.current_account['username'], amount)
+                if new_balance is not None:
+                    self.current_account['balance'] = new_balance
+                    messagebox.showinfo("Success", f"Withdrew ₹{amount:.2f}.\nNew balance: ₹{new_balance:.2f}")
                 else:
-                    messagebox.showerror("Error", f"Insufficient funds. Current balance: ₹{float(self.current_account['balance']):.2f}")
-                self.root.after(200, self.account_menu)
-            except ValueError:
-                messagebox.showerror("Error", "Enter a valid positive amount.")
+                    messagebox.showerror("Error", "Insufficient funds.")
+            self.account_menu()
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", f"Please enter a valid positive number.\n{e}")
 
-        self.image_button(container, "Withdraw", withdraw, "withdraw")
-        self.image_button(container, "Back", self.account_menu, "back")
+    def deposit_screen(self): self.transaction_screen('deposit')
+    def withdraw_screen(self): self.transaction_screen('withdraw')
 
-    def show_statement(self):
-        if not self.current_account:
-            self.main_menu()
+    def statement_screen(self):
+        self.root.geometry("600x700") 
+        self.clear_window()
+        self.header("Account Statement")
+        
+        transactions = self.db.get_transactions(self.current_account['username'])
+        
+        bottom_frame = tk.Frame(self.root, bg="#f7f8fb")
+        bottom_frame.pack(side="bottom", fill="x", padx=20, pady=10)
+        self.create_text_button(bottom_frame, "Back to Account Menu", self.account_menu)
+
+        if not transactions or len(transactions) < 2:
+            no_history_frame = tk.Frame(self.root, bg="#f7f8fb")
+            no_history_frame.pack(fill="both", expand=True)
+            tk.Label(no_history_frame, text="No sufficient transaction history to display.", font=("Segoe UI", 12), bg="#f7f8fb").pack(pady=50)
             return
-        statement = (
-            f"👤 Username: {self.current_account['username']}\n"
-            f"📱 Phone: {self.current_account['phone']}\n"
-            f"💰 Balance: ₹{float(self.current_account['balance']):.2f}"
-        )
-        messagebox.showinfo("Mini statement", statement)
 
+        df = pd.DataFrame(transactions)
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+
+        fig, ax = plt.subplots(figsize=(6, 3), dpi=100)
+        fig.patch.set_facecolor('#f7f8fb')
+        ax.set_facecolor('#ffffff')
+        ax.plot(df['timestamp'], df['balance_after'], marker='o', linestyle='-', color='#007acc', label='Balance')
+        
+        avg_balance = np.mean(df['balance_after'])
+        ax.axhline(y=avg_balance, color='r', linestyle='--', linewidth=1, label=f'Avg: ₹{avg_balance:.2f}')
+
+        ax.set_title("Balance History", fontsize=12)
+        ax.set_ylabel("Balance (₹)", fontsize=10)
+        ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+        ax.legend()
+        ax.xaxis.set_major_formatter(DateFormatter("%d-%b-%y"))
+        plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
+        fig.tight_layout()
+
+        canvas = FigureCanvasTkAgg(fig, master=self.root)
+        canvas.draw()
+        canvas.get_tk_widget().pack(pady=10, padx=25, fill="x", side="top")
+
+        tree_frame = ttk.Frame(self.root, padding=(25, 5))
+        tree_frame.pack(fill="both", expand=True, side="top")
+        
+        cols = ('Timestamp', 'Type', 'Amount', 'Balance')
+        tree = ttk.Treeview(tree_frame, columns=cols, show='headings', selectmode="none")
+        
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        
+        for col in cols: tree.heading(col, text=col)
+        tree.column("Timestamp", width=150); tree.column("Type", width=110)
+        tree.column("Amount", width=100, anchor="e"); tree.column("Balance", width=110, anchor="e")
+
+        for index, row in df.iterrows():
+            amount_str = f"₹{row['amount']:.2f}"
+            balance_str = f"₹{row['balance_after']:.2f}"
+            ts_str = row['timestamp'].strftime("%d-%b-%Y %H:%M")
+            tree.insert("", "end", values=(ts_str, row['transaction_type'], amount_str, balance_str))
+        
+        scrollbar.pack(side="right", fill="y")
+        tree.pack(fill="both", expand=True, side="left")
+        
     def logout(self):
+        logging.info(f"User '{self.current_account['username']}' logged out.")
         self.current_account = None
-        messagebox.showinfo("Logout", "You have been logged out.")
-        self.root.after(150, self.main_menu)
+        messagebox.showinfo("Logout", "You have been logged out successfully.")
+        self.main_menu()
 
     def on_close(self):
-        try:
-            conn.commit()
-            conn.close()
-        except Exception:
-            pass
-        self.root.destroy()
-
+        if messagebox.askokcancel("Exit", "Do you want to exit the application?"):
+            self.db.close()
+            self.root.destroy()
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = BankApp(root)
-    root.mainloop()
+    app_root = tk.Tk()
+    app = BankApp(app_root)
+    app_root.mainloop()
